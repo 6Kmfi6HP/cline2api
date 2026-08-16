@@ -4,9 +4,10 @@ compatibility_date = "2026-08-16"
 account_id = "e6e4cbb45c6929dffdf32ee1b09c6436"
 
 # 需要配置的环境变量：
-#   UPSTREAM_URL  上游 OpenAI 兼容地址，默认 https://api.cline.bot/api/v1/chat/completions
-#   CLINE_API_KEY Cline API Key。敏感值，请用 `wrangler secret put CLINE_API_KEY` 设置，
-#                 不要写进此文件；未设置时透传请求自带的 Authorization。
+#   UPSTREAM_URL      上游 OpenAI 兼容地址，默认 https://api.cline.bot/api/v1/chat/completions
+#   MODELS_UPSTREAM   免费模型列表上游地址，默认 https://api.cline.bot/api/v1/ai/cline/recommended-models
+#   CLINE_API_KEY     Cline API Key。敏感值，请用 `wrangler secret put CLINE_API_KEY` 设置，
+#                     不要写进此文件；未设置时透传请求自带的 Authorization。
 #
 # 示例（非敏感的可写在这里）：
 # [vars]

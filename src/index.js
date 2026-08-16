@@ -2,11 +2,26 @@
 // 使 sub2api（只识别 reasoning_content）能把思考转成 Anthropic thinking block。
 
 const DEFAULT_UPSTREAM = "https://api.cline.bot/api/v1/chat/completions";
+const MODELS_UPSTREAM = "https://api.cline.bot/api/v1/ai/cline/recommended-models";
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000; // 免费模型列表成功缓存时长
+const MODELS_ERROR_CACHE_MS = 30_000;      // 上游失败后的负缓存时长（吸收突发请求）
+const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+// 免费模型列表内存缓存：{ upstream, timestamp, list | error }，成功与失败都缓存；
+// modelsInflight 按 upstream 记录 in-flight promise，同一 upstream 并发只发一次上游请求（同 isolate 内）
+let modelsCache = null;
+const modelsInflight = new Map();
+
 export default {
   async fetch(request, env) {
+    // 模型列表：GET /v1/models（兼容 OpenAI 客户端），只返回免费模型
+    const { pathname } = new URL(request.url);
+    if (request.method === "GET" && ["/v1/models", "/v1/models/", "/models", "/models/"].includes(pathname)) {
+      return handleModelsRequest(env);
+    }
+
     if (request.method !== "POST") {
       return new Response("Method Not Allowed", { status: 405 });
     }
@@ -142,5 +157,78 @@ function rewriteNonStream(json) {
     if (m && typeof m === "object" && m.reasoning != null) {
       if (!m.reasoning_content) m.reasoning_content = m.reasoning;
     }
+  }
+}
+
+// 处理 GET /v1/models：拉取 Cline 推荐模型，只保留 free（免费）模型，转成 OpenAI 兼容格式
+async function handleModelsRequest(env) {
+  const upstream = env.MODELS_UPSTREAM || MODELS_UPSTREAM;
+  try {
+    const list = await fetchFreeModels(upstream);
+    return new Response(JSON.stringify(list), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({
+      error: { message: "models fetch failed: " + e.message, type: "upstream_error" },
+    }), { status: 502, headers: { "Content-Type": "application/json" } });
+  }
+}
+
+// 拉取免费模型列表：成功/失败都按 upstream 缓存（TTL / 负缓存），并发去重避免重复打上游
+async function fetchFreeModels(upstream) {
+  if (modelsCache && modelsCache.upstream === upstream) {
+    const age = Date.now() - modelsCache.timestamp;
+    if (modelsCache.error) {
+      if (age < MODELS_ERROR_CACHE_MS) throw modelsCache.error; // 负缓存：短时间内直接复用上次失败
+    } else if (age < MODELS_CACHE_TTL_MS) {
+      return modelsCache.list;
+    }
+  }
+  if (modelsInflight.has(upstream)) return modelsInflight.get(upstream);
+
+  const promise = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MODELS_FETCH_TIMEOUT_MS);
+    try {
+      // Cline 推荐模型端点无需鉴权；带 UA 与官方客户端一致
+      const resp = await fetch(upstream, {
+        headers: { "User-Agent": "Cline/3.0.38" },
+        signal: controller.signal,
+      });
+      if (!resp.ok) throw new Error("recommended-models returned " + resp.status);
+      const json = await resp.json();
+      const free = Array.isArray(json.free) ? json.free : [];
+
+      const list = {
+        object: "list",
+        data: free
+          .filter((m) => m && typeof m === "object" && m.id && typeof m.id === "string") // 防御脏数据
+          .map((m) => ({
+            id: m.id,
+            object: "model",
+            created: 0,
+            owned_by: m.id.split("/")[0] || "cline",
+            ...(m.name ? { name: m.name } : {}), // 附加字段，客户端可显示友好名
+            ...(m.description ? { description: m.description } : {}),
+          })),
+      };
+
+      modelsCache = { upstream, timestamp: Date.now(), list, error: null };
+      return list;
+    } catch (e) {
+      modelsCache = { upstream, timestamp: Date.now(), list: null, error: e };
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  modelsInflight.set(upstream, promise);
+
+  try {
+    return await promise;
+  } finally {
+    if (modelsInflight.get(upstream) === promise) modelsInflight.delete(upstream);
   }
 }
